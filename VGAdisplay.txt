@@ -1,0 +1,361 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "sys/alt_irq.h"
+#include "system.h"
+#include "io.h"
+#include "altera_up_avalon_video_character_buffer_with_dma.h"
+#include "altera_up_avalon_video_pixel_buffer_dma.h"
+#include <altera_avalon_pio_regs.h>
+#include "altera_up_avalon_ps2.h"
+#include "altera_up_ps2_keyboard.h"
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/queue.h"
+#include "FreeRTOS/timers.h"
+#include "FreeRTOS/semphr.h"
+
+//For frequency plot
+#define FREQPLT_ORI_X 101		//x axis pixel position at the plot origin
+#define FREQPLT_GRID_SIZE_X 5	//pixel separation in the x axis between two data points
+#define FREQPLT_ORI_Y 199.0		//y axis pixel position at the plot origin
+#define FREQPLT_FREQ_RES 20.0	//number of pixels per Hz (y axis scale)
+#define ROCPLT_ORI_X 101
+#define ROCPLT_GRID_SIZE_X 5
+#define ROCPLT_ORI_Y 259.0
+#define ROCPLT_ROC_RES 0.5		//number of pixels per Hz/s (y axis scale)
+
+#define MIN_FREQ 45.0
+#define FREQ_THRESHOLD_INC_AMOUNT 0.5
+#define ROC_THRESHOLD_INC_AMOUNT 1
+
+// Handlers
+TaskHandle_t VGAdisplay;
+TaskHandle_t keyboard_update;
+TaskHandle_t freq_update;
+TimerHandle_t timer;
+
+// Semaphores
+SemaphoreHandle_t sem_freqroc;
+SemaphoreHandle_t sem_thresh;
+SemaphoreHandle_t sem_block;
+
+// global
+static QueueHandle_t Q_freq_data;
+static QueueHandle_t Q_time_stamp;
+static QueueHandle_t Q_keyb_data;
+
+volatile unsigned char timer_expired = 0;
+int stability_status = 0;      // 0 = stable, 1 = unstable
+double freq_threshold = 49.5;
+double roc_threshold = 10.0;
+double freq[100];
+double dfreq[100];
+int freq_value = 99;
+int freq_value_new = 98;
+TickType_t time_stamps[100] = {0};
+
+typedef struct{
+	unsigned int x1;
+	unsigned int y1;
+	unsigned int x2;
+	unsigned int y2;
+}Line;
+
+
+// inst_freq_isr - Fetches frequency values from the memory and pushes to the queue
+void inst_freq_isr(){
+	#define SAMPLING_FREQ 16000.0
+	double temp = SAMPLING_FREQ/(double)IORD(FREQUENCY_ANALYSER_BASE, 0);
+	TickType_t start_time = xTaskGetTickCountFromISR();
+	xQueueSendToBackFromISR(Q_freq_data, &temp, pdFALSE);
+	xQueueSendToBackFromISR(Q_time_stamp, &start_time, pdFALSE);
+	return;
+}
+
+
+// keyboard_isr - Fetches value from the keyboard and pushes to the queue
+void keyboard_isr(void* keyboard, alt_u32 id){
+	char ascii;
+	int status = 0;
+	unsigned char key = 0;
+	KB_CODE_TYPE decode_mode;
+
+	status = decode_scancode(keyboard, &decode_mode , &key , &ascii);
+
+	if ( status == 0 ) //success
+	{
+		// print out the result
+		switch ( decode_mode )
+		{
+		case KB_ASCII_MAKE_CODE :
+			xQueueSendToBackFromISR(Q_keyb_data, &key, pdFALSE);
+			break ;
+
+		default :
+			break ;
+		}
+	}
+}
+
+//freq_calculate_task - Receives frequency and timestamp from queue and calculates roc
+void freq_calculate_task()
+{
+	while(1)
+	{
+		xQueueReceive(Q_freq_data, freq+freq_value, portMAX_DELAY);
+		xQueueReceive(Q_time_stamp, time_stamps+freq_value, (TickType_t) 2);
+		xSemaphoreTake(sem_freqroc, portMAX_DELAY);
+
+		//calculate roc
+		if(freq_value == 0){
+			dfreq[0] = (freq[0]-freq[99]) * 2.0 * freq[0] * freq[99] / (freq[0]+freq[99]);
+		} else {
+			dfreq[freq_value] = (freq[freq_value]-freq[freq_value-1]) * 2.0 * freq[freq_value]* freq[freq_value-1] / (freq[freq_value]+freq[freq_value-1]);
+		}
+
+		if (dfreq[freq_value] > 100.0){
+			dfreq[freq_value] = 100.0;
+		}
+
+		freq_value = (++freq_value) % 100;  // point to the next data (oldest) to be overwritten
+		freq_value_new = (++freq_value_new) % 100;
+		xSemaphoreGive(sem_freqroc);
+
+		//check stability
+			if ((freq[freq_value_new] < freq_threshold) || (fabs(dfreq[freq_value_new]) > roc_threshold)) {
+				stability_status = 1;
+				printf("unstable\n");
+			}
+			else{
+				stability_status = 0;
+				printf("stable\n");
+			}
+	}
+}
+
+
+//keyboard_update_task - Fetches keyboard data from queue and updates frequency thresholds
+void keyboard_update_task(){
+	unsigned char key;
+	unsigned char key_pressed = 0;
+
+	while(1){
+		xQueueReceive(Q_keyb_data, &key, portMAX_DELAY);
+
+		switch (key)
+		{
+		case 0x72:  // DOWN
+			if (key_pressed){
+				key_pressed = 0;
+			} else {
+				key_pressed = 1;
+				//printf("Freq decrease\n");
+
+				if (xSemaphoreTake(sem_thresh, (TickType_t ) 10)){
+					freq_threshold -= FREQ_THRESHOLD_INC_AMOUNT;
+
+					if (freq_threshold < 0.0){
+						freq_threshold = 0;
+					}
+					xSemaphoreGive(sem_thresh);
+				}
+			}
+			break;
+
+		case 0x75:  // UP
+			if (key_pressed){
+				key_pressed = 0;
+			} else {
+				key_pressed = 1;
+				//printf("Freq increase\n");
+
+				if (xSemaphoreTake(sem_thresh, (TickType_t ) 10)){
+					freq_threshold += FREQ_THRESHOLD_INC_AMOUNT;
+
+					if (freq_threshold < 0.0){
+						freq_threshold = 0;
+					}
+
+					xSemaphoreGive(sem_thresh);
+				}
+			}
+			break;
+
+		case 0x6b:  // LEFT
+			if (key_pressed){
+				key_pressed = 0;
+			} else {
+				key_pressed = 1;
+				//printf("ROC decrease\n");
+
+				if (xSemaphoreTake(sem_thresh, (TickType_t ) 10)){
+					roc_threshold -= ROC_THRESHOLD_INC_AMOUNT;
+
+					if (roc_threshold < 0.0){
+						roc_threshold = 0;
+					}
+
+					xSemaphoreGive(sem_thresh);
+				}
+			}
+			break;
+
+		case 0x74:  // RIGHT
+			if (key_pressed){
+				key_pressed = 0;
+			} else {
+				key_pressed = 1;
+				//printf("ROC increase\n");
+
+				if (xSemaphoreTake(sem_thresh, (TickType_t ) 10)){
+					roc_threshold += ROC_THRESHOLD_INC_AMOUNT;
+
+					if (roc_threshold < 0.0){
+						roc_threshold = 0;
+					}
+
+					xSemaphoreGive(sem_thresh);
+				}
+			}
+			break;
+
+		default:
+			//printf("key = %c\n", &key);
+			break;
+		}
+
+	}
+}
+
+void VGAdisplay_Task(void *pvParameters ){
+	//initialize VGA controllers
+	alt_up_pixel_buffer_dma_dev *pixel_buf;
+	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+	if(pixel_buf == NULL){
+		printf("can't find pixel buffer device\n");
+	}
+	alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+	alt_up_char_buffer_dev *char_buf;
+	char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+	if(char_buf == NULL){
+		printf("can't find char buffer device\n");
+	}
+	alt_up_char_buffer_clear(char_buf);
+
+
+	//Set up plot axes
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 50, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 220, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+
+	alt_up_char_buffer_string(char_buf, "Frequency(Hz)", 4, 4);
+	alt_up_char_buffer_string(char_buf, "52", 10, 7);
+	alt_up_char_buffer_string(char_buf, "50", 10, 12);
+	alt_up_char_buffer_string(char_buf, "48", 10, 17);
+	alt_up_char_buffer_string(char_buf, "46", 10, 22);
+
+	alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)", 4, 26);
+	alt_up_char_buffer_string(char_buf, "60", 10, 28);
+	alt_up_char_buffer_string(char_buf, "30", 10, 30);
+	alt_up_char_buffer_string(char_buf, "0", 10, 32);
+	alt_up_char_buffer_string(char_buf, "-30", 9, 34);
+	alt_up_char_buffer_string(char_buf, "-60", 9, 36);
+
+	alt_up_char_buffer_string(char_buf, "Run Time                 = ", 12, 40);
+	alt_up_char_buffer_string(char_buf, "Frequency Threshold (Hz) =       (Up/Down arrows)", 12, 42);
+	alt_up_char_buffer_string(char_buf, "RoC Threshold (Hz/s)     =       (Left/Right arrows)", 12, 44);
+	int j = 0;
+	Line line_freq, line_roc;
+
+	char temp_buf[6];
+	unsigned int milisec;
+
+	const TickType_t task_period = 100;  // 30 Hz
+	TickType_t last_wake_time;
+
+	while(1){
+		last_wake_time = xTaskGetTickCount();
+		vTaskDelayUntil(&last_wake_time, task_period);
+
+		milisec = xTaskGetTickCount();
+
+		sprintf(temp_buf, "%02d:%02d:%02d.%1d", (milisec/3600000) % 24, (milisec/60000) % 60, (milisec/1000) % 60, (milisec/100) % 10);
+		alt_up_char_buffer_string(char_buf, temp_buf, 40, 40);
+
+		// Read thresholds and print to screen
+		sprintf(temp_buf, "%2.1f", freq_threshold);
+		alt_up_char_buffer_string(char_buf, temp_buf, 40, 42);
+		sprintf(temp_buf, "%2.1f ", roc_threshold);
+		alt_up_char_buffer_string(char_buf, temp_buf, 40, 44);
+
+		//clear old graph to draw new graph
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 0, 639, 199, 0, 0);
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 201, 639, 299, 0, 0);
+
+		for(j=0;j<99;++j){ //i here points to the oldest data, j loops through all the data to be drawn on VGA
+			if (((int)(freq[(freq_value+j)%100]) > MIN_FREQ) && ((int)(freq[(freq_value+j+1)%100]) > MIN_FREQ)){
+				//Calculate coordinates of the two data points to draw a line in between
+				//Frequency plot
+				line_freq.x1 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * j;
+				line_freq.y1 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(freq_value+j)%100] - MIN_FREQ));
+
+				line_freq.x2 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * (j + 1);
+				line_freq.y2 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(freq_value+j+1)%100] - MIN_FREQ));
+
+				//Frequency RoC plot
+				line_roc.x1 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * j;
+				line_roc.y1 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(freq_value+j)%100]);
+
+				line_roc.x2 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * (j + 1);
+				line_roc.y2 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(freq_value+j+1)%100]);
+
+				//Draw
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1, line_freq.x2, line_freq.y2, 0x3ff << 0, 0);
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
+			}
+		}
+	}
+}
+
+
+int main()
+{
+	// FreeRTOS initialisation
+	// Initialise queues
+	Q_freq_data = xQueueCreate( 100, sizeof(double) );
+	Q_time_stamp = xQueueCreate(100, sizeof(TickType_t));
+	Q_keyb_data = xQueueCreate(5, sizeof(unsigned char));
+
+	// Initialise semaphores
+	sem_freqroc = xSemaphoreCreateMutex();
+	sem_thresh = xSemaphoreCreateMutex();
+	sem_block = xSemaphoreCreateBinary();
+
+	xSemaphoreGive(sem_freqroc);
+	xSemaphoreGive(sem_thresh);
+	xSemaphoreGive(sem_block);
+
+	// Hardware initialisation
+	// Initialise ps2 device
+	alt_up_ps2_dev * keyboard = alt_up_ps2_open_dev(PS2_NAME);
+
+	// Reigster Interrupts
+	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, inst_freq_isr);
+	alt_irq_register(PS2_IRQ, keyboard, keyboard_isr);
+	alt_up_ps2_enable_read_interrupt(keyboard);
+
+	// Tasks
+	xTaskCreate(VGAdisplay_Task, "DrawTsk", configMINIMAL_STACK_SIZE, NULL, 1 , &VGAdisplay);
+	xTaskCreate(keyboard_update_task, "keyboard_update_task", configMINIMAL_STACK_SIZE, NULL, 4 , &keyboard_update);
+	xTaskCreate(freq_calculate_task, "freq_calculate_task", configMINIMAL_STACK_SIZE, NULL, 5 , &freq_update);
+
+
+	vTaskStartScheduler();
+
+	while(1);
+
+  return 0;
+}
