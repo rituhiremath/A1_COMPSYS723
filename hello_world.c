@@ -198,7 +198,7 @@ void switch_ISR(void* context, alt_u32 id)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     // read the switches
     uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-	printf(uiSwitchValue);
+	printf("%d", uiSwitchValue);
     // if the switch configuration has changed
     if (uiSwitchValue != uiSwitchValuePrevious) {
         if (currentState == unstableState && (uiSwitchValue | 0x1F)) {
