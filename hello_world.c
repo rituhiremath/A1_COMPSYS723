@@ -1,19 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "sys/alt_irq.h"
-#include "system.h"
-#include "io.h"
-#include "altera_up_avalon_video_character_buffer_with_dma.h"
-#include "altera_up_avalon_video_pixel_buffer_dma.h"
-#include "altera_avalon_pio_regs.h"
-#include "altera_up_avalon_ps2.h"
-#include "altera_up_ps2_keyboard.h"
-#include "FreeRTOS/FreeRTOS.h"
-#include "FreeRTOS/task.h"
-#include "FreeRTOS/queue.h"
-#include "FreeRTOS/timers.h"
-#include "FreeRTOS/semphr.h"
+#include <sys/alt_irq.h>
+#include <system.h>
+#include <io.h>
+#include <altera_up_avalon_video_character_buffer_with_dma.h>
+#include <altera_up_avalon_video_pixel_buffer_dma.h>
+#include <altera_avalon_pio_regs.h>
+#include <altera_up_avalon_ps2.h>
+#include <altera_up_ps2_keyboard.h>
+#include <freertos/FreeRTOS.h>
+#include <FreeRTOS/task.h>
+#include <FreeRTOS/queue.h>
+#include <FreeRTOS/timers.h>
+#include <FreeRTOS/semphr.h>
 
 #define CRITICAL_PERIOD_POLL 500
 #define SWITCH_POLLING_PERIOD_MS 100
@@ -44,12 +44,16 @@ TimerHandle_t timer;
 SemaphoreHandle_t sem_freqroc;
 SemaphoreHandle_t sem_thresh;
 SemaphoreHandle_t sem_block;
+SemaphoreHandle_t maintenanceModeSemaphore;
+SemaphoreHandle_t xQueueSwitchSemaphore;
 
-// global
+// Queues
 static QueueHandle_t Q_freq_data;
 static QueueHandle_t Q_time_stamp;
 static QueueHandle_t Q_keyb_data;
+QueueHandle_t loadsShedQueue;
 
+// Global variables
 volatile unsigned char timer_expired = 0;
 int stability_status = 0;      // 0 = stable, 1 = unstable
 double freq_threshold = 49.5;
@@ -58,8 +62,16 @@ double freq[100];
 double dfreq[100];
 int freq_value = 99;
 int freq_value_new = 98;
-TickType_t time_stamps[100] = {0};
-
+volatile unsigned int uiSwitchValue;
+volatile unsigned int uiSwitchValuePrevious;
+volatile int loadsShed = 0;
+enum state {stableState, unstableState, monitorNetworkState, maintenanceState};
+typedef enum state State;
+static volatile State currentState = stableState;
+static volatile State nextState = stableState;
+volatile int maintenanceMode = 0;
+volatile int i = 0;
+volatile int checkTimerComplete = 0;
 typedef struct{
 	unsigned int x1;
 	unsigned int y1;
@@ -75,42 +87,22 @@ TickType_t timerOneStart;
 TickType_t timerOneEnd;
 TickType_t timerTwoEnd;
 TickType_t currentTime;
+TickType_t time_stamps[100] = {0};
 TimerHandle_t timerTwo;
-
-// Queue
-QueueHandle_t switch_queue;
-QueueHandle_t loadsShedQueue;
-//static QueueHandle_t timer_queue;
-
-// Definition of Semaphore
-SemaphoreHandle_t stabilityStatus;
-SemaphoreHandle_t maintenanceModeSemaphore;
-SemaphoreHandle_t xQueueSwitchSemaphore;
-
-// global variables
-volatile unsigned int uiSwitchValue;
-volatile unsigned int uiSwitchValuePrevious;
-volatile int loadsShed = 0;
-enum state {stableState, unstableState, monitorNetworkState, maintenanceState};
-typedef enum state State;
-static volatile State currentState = stableState;
-static volatile State nextState = stableState;
 
 // Local Function Prototypes
 void vLoadSheddingTask(void *pvParameters);
-void switch_ISR(void* context, alt_u32 id);
 void vSwitchPollingTask(void *pvParameters);
 void button_ISR(void* context, alt_u32 id);
 
 void vLoadSheddingTask(void *pvParameters)
 {
-   if ((freq[freq_value_new] < freq_threshold) || (fabs(dfreq[freq_value_new]) > roc_threshold)) {
-   	stability_status = 1;
+	if ((freq[freq_value_new] < freq_threshold) || (fabs(dfreq[freq_value_new]) > roc_threshold)) {
+		stability_status = 1;
+	} else	{
+		stability_status = 0;
    }
-   else{
-   	stability_status = 0;
-   }
-   while(1) {
+    while(1) {
         switch (currentState) {
             case stableState:
                 if (!stability_status) {
@@ -123,7 +115,7 @@ void vLoadSheddingTask(void *pvParameters)
                 break;
             case unstableState:
                 // Determine which load to reconnect based on priority and whether it was previously shed.
-                for (int i = 0; i < NUM_LOADS; i++) {
+                for (i = 0; i < NUM_LOADS; i++) {
                     // find the first load that is ON
                     if (IORD_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE) & (1 << i)) {
                         // switch it off by turning red OFF
@@ -143,13 +135,17 @@ void vLoadSheddingTask(void *pvParameters)
                     }
                     timerOneEnd = xTaskGetTickCount();
                 }
+                i = 0;
                 loadsShed++;
                 nextState = monitorNetworkState;
                 break;
             case monitorNetworkState:
-                currentTime = xTaskGetTickCount();
                 // Check if 500ms has elapsed since TimerOne started
-                if (xTimerIsTimerActive(timerTwo) && (currentTime - timerOneStart >= pdMS_TO_TICKS(500))) {
+                while (!checkTimerComplete) {
+                	;;
+                }
+                currentTime = xTaskGetTickCount();
+                if (currentTime - timerOneStart >= pdMS_TO_TICKS(500)) {
                     if (stabilityStatus) {
                         // Reconnect any previously shed loads
                         while (xQueueReceive(loadsShedQueue, &loadsShed, 0) == pdTRUE) {
@@ -172,6 +168,8 @@ void vLoadSheddingTask(void *pvParameters)
                             nextState = unstableState;
                         }
                 }
+                xTimerReset(timerTwo, 0);
+                checkTimerComplete = 0;
                 break;
 
             case maintenanceState:
@@ -189,25 +187,40 @@ void vSwitchPollingTask(void *pvParameters)
     const TickType_t xDelay = pdMS_TO_TICKS(SWITCH_POLLING_PERIOD_MS); // poll every 100ms
     xLastWakeTime = xTaskGetTickCount();
     while (1) {
-        if (xSemaphoreTake(xQueueSwitchSemaphore, portMAX_DELAY) == pdTRUE) {
-            taskENTER_CRITICAL();
-            vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
-            uint32_t uiSwitchValueRead = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-            uint32_t uiSwitchValueWrite = uiSwitchValueRead; // default to read value
-            // do some processing on the switch values if necessary
-            if (uiSwitchValueRead & 0x01) {
-                uiSwitchValueWrite |= 0x10; // set bit 4 if bit 0 is set
-            } else {
-                uiSwitchValueWrite &= 0xEF; // clear bit 4 if bit 0 is cleared
-            }
-            IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, uiSwitchValueWrite); // write the new switch value
-            uiSwitchValue = uiSwitchValueRead;
-            vTaskPrioritySet(NULL, tskIDLE_PRIORITY);
-            taskEXIT_CRITICAL();
-            // ...
-            xSemaphoreGive(xQueueSwitchSemaphore);
-        }
-        vTaskDelayUntil(&xLastWakeTime, xDelay);
+    	if (currentState == stableState) {
+			if (xSemaphoreTake(xQueueSwitchSemaphore, portMAX_DELAY) == pdTRUE) {
+				taskENTER_CRITICAL();
+				vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+				uint32_t uiSwitchValueRead = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+				uint32_t uiSwitchValueWrite = uiSwitchValueRead; // default to read value
+				// do some processing on the switch values if necessary
+				if (uiSwitchValueRead & 0x01) {
+					uiSwitchValueWrite |= 0x10; // set bit 4 if bit 0 is set
+				} else {
+					uiSwitchValueWrite &= 0xEF; // clear bit 4 if bit 0 is cleared
+				}
+				IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, uiSwitchValueWrite); // write the new switch value
+				uiSwitchValue = uiSwitchValueRead;
+				vTaskPrioritySet(NULL, tskIDLE_PRIORITY);
+				taskEXIT_CRITICAL();
+				// ...
+				xSemaphoreGive(xQueueSwitchSemaphore);
+			} else {
+				// read the current switch value
+				uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+
+				// check if the switch has turned OFF (i.e., from 1 to 0)
+				if (uiSwitchValuePrevious == 1 && uiSwitchValue == 0) {
+					// write to uiSwitchValueWrite here
+					IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, uiSwitchValue);
+				}
+
+				// update previous switch value with the current value
+				uiSwitchValuePrevious = uiSwitchValue;
+			}
+			// avoid busy waiting
+			vTaskDelayUntil(&xLastWakeTime, xDelay);
+    	}
     }
 }
 
@@ -230,19 +243,15 @@ void button_ISR(void* context, alt_u32 id)
             xSemaphoreGiveFromISR(maintenanceModeSemaphore, &xHigherPriorityTaskWoken);
         }
         if (xHigherPriorityTaskWoken == pdTRUE) {
-            portYIELD_FROM_ISR();
+            portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
         }
     }
     // clears the edge capture register
     IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 }
 
-
-void timer_500ms_isr(xTimerHandle t_timer){
-	//timer_expired = 1;
-
-	//BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	//vTaskNotifyGiveFromISR(load_mngr_handle, &xHigherPriorityTaskWoken);
+void globalTimerCallback(void *pvParameters){
+	checkTimerComplete = 1;
 }
 
 // inst_freq_isr - Fetches frequency values from the memory and pushes to the queue
@@ -254,7 +263,6 @@ void inst_freq_isr(){
 	xQueueSendToBackFromISR(Q_time_stamp, &start_time, pdFALSE);
 	return;
 }
-
 
 // keyboard_isr - Fetches value from the keyboard and pushes to the queue
 void keyboard_isr(void* keyboard, alt_u32 id){
@@ -502,11 +510,10 @@ void VGAdisplay_Task(void *pvParameters ){
 
 int main() {
 	// FreeRTOS initialisation
-	 	maintenanceModeSemaphore = xSemaphoreCreateMutex();
-	 	xQueueSwitchSemaphore = xSemaphoreCreateBinary();
-		xSemaphoreGive(switchValueSemaphore);
-	 	switch_queue = xQueueCreate(QUEUE_SWITCH_LENGTH, sizeof(int));
+	 	maintenanceModeSemaphore = xSemaphoreCreateBinary();
+	 	xQueueSwitchSemaphore = xSemaphoreCreateMutex();
 	   	loadsShedQueue = xQueueCreate(QUEUE_LOADS_LENGTH, sizeof(int));
+	   	
 		// Initialise queues
 		Q_freq_data = xQueueCreate( 100, sizeof(double) );
 		Q_time_stamp = xQueueCreate(100, sizeof(TickType_t));
@@ -520,6 +527,8 @@ int main() {
 		xSemaphoreGive(sem_freqroc);
 		xSemaphoreGive(sem_thresh);
 		xSemaphoreGive(sem_block);
+		xSemaphoreGive(maintenanceModeSemaphore);
+		xSemaphoreGive(xQueueSwitchSemaphore);
 
 		// Hardware initialisation
 		// Initialise ps2 device
@@ -529,24 +538,21 @@ int main() {
 		alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, inst_freq_isr);
 		alt_irq_register(PS2_IRQ, keyboard, keyboard_isr);
 		alt_up_ps2_enable_read_interrupt(keyboard);
+		IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
+		// Enable the switch button interrupt
+		IOWR_ALTERA_AVALON_PIO_IRQ_MASK(SLIDE_SWITCH_BASE, 0x7);
+		// register the ISR
+		alt_irq_register(PUSH_BUTTON_IRQ, NULL, button_ISR);
 
 		// Tasks
-		xTaskCreate(VGAdisplay_Task, "DrawTsk", configMINIMAL_STACK_SIZE, NULL, 1 , &VGAdisplay);
-		xTaskCreate(keyboard_update_task, "keyboard_update_task", configMINIMAL_STACK_SIZE, NULL, 4 , &keyboard_update);
+		xTaskCreate(VGAdisplay_Task, "DrawTsk", configMINIMAL_STACK_SIZE, NULL, 2, &VGAdisplay);
+		xTaskCreate(keyboard_update_task, "keyboard_update_task", configMINIMAL_STACK_SIZE, NULL, 3, &keyboard_update);
 		xTaskCreate(freq_calculate_task, "freq_calculate_task", configMINIMAL_STACK_SIZE, NULL, 5 , &freq_update);
-		xTaskCreate(vLoadSheddingTask, "LoadSheddingTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
-		xTaskCreate(button_ISR, "ButtonISR", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
-		xTaskCreate(switch_ISR, "SwitchISR", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
-		xTaskCreate(vSwitchPollingTask, "SwitchPollingTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
-		timerTwo = xTimerCreate("500Timer", CRITICAL_PERIOD_POLL / portTICK_PERIOD_MS, pdFALSE, 0, timer_500ms_isr);
-
-	    // enable interrupts for all buttons
-	    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
-	    // Enable the switch button interrupt
-	    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(SLIDE_SWITCH_BASE, 0x7);
-	    // register the ISR
-	    alt_irq_register(SLIDE_SWITCH_IRQ, NULL, switch_ISR);
-	    alt_irq_register(PUSH_BUTTON_IRQ,(void*)&button_ISR, NULL);
+		xTaskCreate(vLoadSheddingTask, "LoadSheddingTask", configMINIMAL_STACK_SIZE, NULL, 4, NULL);
+		xTaskCreate(vSwitchPollingTask, "SwitchPollingTask", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
+		
+		// Timers
+		timerTwo = xTimerCreate("500Timer", CRITICAL_PERIOD_POLL / portTICK_PERIOD_MS, pdFALSE, 0, globalTimerCallback);
 
 		vTaskStartScheduler();
 
