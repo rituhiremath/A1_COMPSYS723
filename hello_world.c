@@ -177,17 +177,15 @@ void vLoadSheddingTask(void *pvParameters)
     }
 }
 
-
 void vSwitchPollingTask(void *pvParameters)
 {
     TickType_t xLastWakeTime;
     const TickType_t xDelay = pdMS_TO_TICKS(SWITCH_POLLING_PERIOD_MS); // poll every 100ms
     xLastWakeTime = xTaskGetTickCount();
-    unsigned int switch_value;
     while (1) {
-        if (xQueueReceive(switch_queue, &switch_value, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(switch_queue, &uiSwitchValue, portMAX_DELAY) == pdTRUE) {
             // write the value of the switch to the red LEDs
-            IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, switch_value);
+            IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
         }
         vTaskDelayUntil(&xLastWakeTime, xDelay);
     }
@@ -198,7 +196,6 @@ void switch_ISR(void* context, alt_u32 id)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     // read the switches
     uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-	printf("%d", uiSwitchValue);
     // if the switch configuration has changed
     if (uiSwitchValue != uiSwitchValuePrevious) {
         if (currentState == unstableState && (uiSwitchValue | 0x1F)) {
