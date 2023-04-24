@@ -104,7 +104,13 @@ void button_ISR(void* context, alt_u32 id);
 
 void vLoadSheddingTask(void *pvParameters)
 {
-    while(1) {
+   if ((freq[freq_value_new] < freq_threshold) || (fabs(dfreq[freq_value_new]) > roc_threshold)) {
+   	stability_status = 1;
+   }
+   else{
+   	stability_status = 0;
+   }
+   while(1) {
         switch (currentState) {
             case stableState:
                 if (!stability_status) {
