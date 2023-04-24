@@ -84,7 +84,7 @@ QueueHandle_t loadsShedQueue;
 
 // Definition of Semaphore
 SemaphoreHandle_t stabilityStatus;
-SemaphoreHandle_t maintenanceMode;
+SemaphoreHandle_t maintenanceModeSemaphore;
 SemaphoreHandle_t xQueueSwitchSemaphore;
 
 // global variables
@@ -183,31 +183,25 @@ void vSwitchPollingTask(void *pvParameters)
     const TickType_t xDelay = pdMS_TO_TICKS(SWITCH_POLLING_PERIOD_MS); // poll every 100ms
     xLastWakeTime = xTaskGetTickCount();
     while (1) {
-        if (xQueueReceive(switch_queue, &uiSwitchValue, portMAX_DELAY) == pdTRUE) {
-            // write the value of the switch to the red LEDs
-            IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
+        if (xSemaphoreTake(xQueueSwitchSemaphore, portMAX_DELAY) == pdTRUE) {
+            taskENTER_CRITICAL();
+            vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+            uint32_t uiSwitchValueRead = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+            uint32_t uiSwitchValueWrite = uiSwitchValueRead; // default to read value
+            // do some processing on the switch values if necessary
+            if (uiSwitchValueRead & 0x01) {
+                uiSwitchValueWrite |= 0x10; // set bit 4 if bit 0 is set
+            } else {
+                uiSwitchValueWrite &= 0xEF; // clear bit 4 if bit 0 is cleared
+            }
+            IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, uiSwitchValueWrite); // write the new switch value
+            uiSwitchValue = uiSwitchValueRead;
+            vTaskPrioritySet(NULL, tskIDLE_PRIORITY);
+            taskEXIT_CRITICAL();
+            // ...
+            xSemaphoreGive(xQueueSwitchSemaphore);
         }
         vTaskDelayUntil(&xLastWakeTime, xDelay);
-    }
-}
-
-void switch_ISR(void* context, alt_u32 id)
-{
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    // read the switches
-    uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-    // if the switch configuration has changed
-    if (uiSwitchValue != uiSwitchValuePrevious) {
-        if (currentState == unstableState && (uiSwitchValue | 0x1F)) {
-            uiSwitchValue = uiSwitchValuePrevious;
-            return;
-        }
-        uiSwitchValuePrevious = uiSwitchValue;
-        if (xSemaphoreTakeFromISR(xQueueSwitchSemaphore, &xHigherPriorityTaskWoken) == pdTRUE) {
-            if (xQueueSendToBackFromISR(switch_queue, &uiSwitchValue, NULL) == pdTRUE) {
-                xSemaphoreGiveFromISR(xQueueSwitchSemaphore, &xHigherPriorityTaskWoken);
-            }
-        }
     }
 }
 
@@ -215,24 +209,28 @@ void button_ISR(void* context, alt_u32 id)
 {
     int* temp = (int*) context;
     (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     // checks if any of the buttons have been pressed
     if ((*temp) & 0x7) {
-    if (maintenanceMode == 0) {
-        xSemaphoreTakeFromISR(maintenanceMode, &xHigherPriorityTaskWoken);
-        maintenanceMode = 1;
-        currentState = maintenanceState;
-        xSemaphoreGiveFromISR(maintenanceMode, &xHigherPriorityTaskWoken);
-    } else {
-        xSemaphoreTakeFromISR(maintenanceMode, &xHigherPriorityTaskWoken);
-        maintenanceMode = 0;
-        currentState = stableState;
-        xSemaphoreGiveFromISR(maintenanceMode, &xHigherPriorityTaskWoken);
-    }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        if (maintenanceMode == 0) {
+            xSemaphoreTakeFromISR(maintenanceModeSemaphore, &xHigherPriorityTaskWoken);
+            maintenanceMode = 1;
+            currentState = maintenanceState;
+            xSemaphoreGiveFromISR(maintenanceModeSemaphore, &xHigherPriorityTaskWoken);
+        } else {
+            xSemaphoreTakeFromISR(maintenanceModeSemaphore, &xHigherPriorityTaskWoken);
+            maintenanceMode = 0;
+            currentState = stableState;
+            xSemaphoreGiveFromISR(maintenanceModeSemaphore, &xHigherPriorityTaskWoken);
+        }
+        if (xHigherPriorityTaskWoken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
     }
     // clears the edge capture register
     IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 }
+
 
 void timer_500ms_isr(xTimerHandle t_timer){
 	//timer_expired = 1;
@@ -498,10 +496,11 @@ void VGAdisplay_Task(void *pvParameters ){
 
 int main() {
 	// FreeRTOS initialisation
-	 	maintenanceMode = xSemaphoreCreateMutex();
-	 	xQueueSwitchSemaphore = xSemaphoreCreateMutex();
+	 	maintenanceModeSemaphore = xSemaphoreCreateMutex();
+	 	xQueueSwitchSemaphore = xSemaphoreCreateBinary();
+		xSemaphoreGive(switchValueSemaphore);
 	 	switch_queue = xQueueCreate(QUEUE_SWITCH_LENGTH, sizeof(int));
-	    loadsShedQueue = xQueueCreate(QUEUE_LOADS_LENGTH, sizeof(int));
+	   	loadsShedQueue = xQueueCreate(QUEUE_LOADS_LENGTH, sizeof(int));
 		// Initialise queues
 		Q_freq_data = xQueueCreate( 100, sizeof(double) );
 		Q_time_stamp = xQueueCreate(100, sizeof(TickType_t));
