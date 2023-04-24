@@ -195,23 +195,23 @@ void vSwitchPollingTask(void *pvParameters)
 
 void switch_ISR(void* context, alt_u32 id)
 {
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     // read the switches
     uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+	printf(uiSwitchValue);
     // if the switch configuration has changed
-    if (currentState == unstableState) {
-        if (uiSwitchValue | 0x1F) {
+    if (uiSwitchValue != uiSwitchValuePrevious) {
+        if (currentState == unstableState && (uiSwitchValue | 0x1F)) {
             uiSwitchValue = uiSwitchValuePrevious;
+            return;
+        }
+        uiSwitchValuePrevious = uiSwitchValue;
+        if (xSemaphoreTakeFromISR(xQueueSwitchSemaphore, &xHigherPriorityTaskWoken) == pdTRUE) {
+            if (xQueueSendToBackFromISR(switch_queue, &uiSwitchValue, NULL) == pdTRUE) {
+                xSemaphoreGiveFromISR(xQueueSwitchSemaphore, &xHigherPriorityTaskWoken);
+            }
         }
     }
-    if (uiSwitchValue != uiSwitchValuePrevious) {
-        // Wait for the semaphore to be available
-        xSemaphoreTakeFromISR(xQueueSwitchSemaphore, &xHigherPriorityTaskWoken);
-        uiSwitchValuePrevious = uiSwitchValue;
-        xQueueSendToBackFromISR(switch_queue, &uiSwitchValue, &xHigherPriorityTaskWoken);
-        xSemaphoreGiveFromISR(xQueueSwitchSemaphore, &xHigherPriorityTaskWoken);
-    }
-	printf("SWITCH\n");
 }
 
 void button_ISR(void* context, alt_u32 id)
